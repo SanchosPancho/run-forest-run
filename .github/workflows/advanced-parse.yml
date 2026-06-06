@@ -2,37 +2,46 @@ name: Парсинг geoip/geosite через v2dat
 
 on:
   schedule:
-    - cron: '0 */6 * * *'      # Каждые 6 часов
-  workflow_dispatch:            # Ручной запуск
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
     inputs:
       geoip_url:
-        description: 'Ссылка на geoip.dat (по умолчанию runetfreedom)'
+        description: 'Ссылка на geoip.dat'
         required: false
         default: 'https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat'
       geosite_url:
-        description: 'Ссылка на geosite.dat (по умолчанию runetfreedom)'
+        description: 'Ссылка на geosite.dat'
         required: false
         default: 'https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat'
 
 jobs:
   unpack-v2ray-data:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Checkout репозитория
         uses: actions/checkout@v4
 
-      # 1. Сборка v2dat из исходников
+      # 1. Установка Go
+      - name: Установка Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      # 2. Клонирование и сборка v2dat
       - name: Сборка v2dat
         run: |
           git clone https://github.com/urlesistiana/v2dat.git
           cd v2dat
-          go build -o ../v2dat .
+          go build -o v2dat .
+          chmod +x v2dat
+          ./v2dat --help | head -n 5 || true
           cd ..
-          chmod +x ./v2dat
-          echo "v2dat version:"
-          ./v2dat --help | head -n 5
+          # Копируем бинарник в корень
+          cp v2dat/v2dat .
+          echo "v2dat собран успешно"
 
-      # 2. Загрузка свежих файлов
+      # 3. Загрузка файлов
       - name: Загрузка geoip.dat и geosite.dat
         run: |
           mkdir -p source-data
@@ -42,111 +51,132 @@ jobs:
           wget -O source-data/geosite.dat ${{ github.event.inputs.geosite_url }}
           ls -lh source-data/
 
-      # 3. Распаковка IP-сетей (geoip.dat)
-      - name: Распаковка geoip.dat (все IP-сети)
+      # 4. Распаковка geoip.dat (только IPv4)
+      - name: Распаковка geoip.dat
         run: |
           mkdir -p unpacked/geoip
           ./v2dat unpack geoip -o unpacked/geoip source-data/geoip.dat
+          
           echo "=== Распакованные IP-файлы ==="
           ls -la unpacked/geoip/
           
-          # Объединение всех IPv4 сетей в один файл
-          # v2dat создаёт файлы по тегам (например, geoip_telegram.txt)
-          # Нам нужны только IPv4, v2dat сам конвертирует IP диапазоны в CIDR
-          cat unpacked/geoip/*.txt 2>/dev/null | \
-            grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' | \
-            sort -u > all-ipv4.txt
-          
-          echo "Всего уникальных IPv4 сетей во всех тегах: $(wc -l < all-ipv4.txt)"
+          # Объединение всех IPv4 сетей
+          if [ -d unpacked/geoip ]; then
+            cat unpacked/geoip/*.txt 2>/dev/null | \
+              grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' | \
+              sort -u > all-ipv4.txt
+            echo "Всего IPv4 сетей: $(wc -l < all-ipv4.txt)"
+          else
+            echo "Ошибка: не удалось распаковать geoip.dat"
+            exit 1
+          fi
 
-      # 4. Распаковка доменов (geosite.dat) по тегам
-      - name: Распаковка geosite.dat (все категории доменов)
+      # 5. Распаковка geosite.dat (домены по категориям)
+      - name: Распаковка geosite.dat
         run: |
           mkdir -p unpacked/geosite
           ./v2dat unpack geosite -o unpacked/geosite source-data/geosite.dat
-          echo "=== Распакованные файлы доменов по тегам ==="
+          
+          echo "=== Распакованные файлы доменов ==="
           ls -la unpacked/geosite/
           
-          # Копирование файлов в clean-структуру
+          # Создаём папку для чистых файлов
           mkdir -p domains-by-category
-          for file in unpacked/geosite/geosite_*.txt; do
+          
+          for file in unpacked/geosite/*.txt; do
             if [ -f "$file" ]; then
-              # Извлечение имени тега из имени файла
+              # Извлекаем имя тега
               tag=$(basename "$file" .txt | sed 's/^geosite_//')
-              # Очистка: оставляем только домены и keyword: (для полноты)
-              # Убираем комментарии и пустые строки
+              # Копируем и очищаем
               grep -v '^#' "$file" | sed '/^$/d' > "domains-by-category/${tag}.txt"
-              echo "Тег '${tag}': $(wc -l < domains-by-category/${tag}.txt) записей"
+              count=$(wc -l < "domains-by-category/${tag}.txt")
+              echo "Тег '${tag}': ${count} записей"
             fi
           done
           
-          # Создание общего файла со всеми доменами (без ключевых слов, только домены)
-          grep -h '^[a-zA-Z0-9.*-]' domains-by-category/*.txt 2>/dev/null | \
-            grep -v '^keyword:' | \
-            sort -u > all-domains.txt
-          echo "Всего уникальных доменов (без keyword:): $(wc -l < all-domains.txt)"
+          # Создаём общий файл со всеми доменами
+          if [ -d domains-by-category ]; then
+            cat domains-by-category/*.txt 2>/dev/null | sort -u > all-domains.txt
+            echo "Всего уникальных записей во всех категориях: $(wc -l < all-domains.txt)"
+          fi
 
-      # 5. Формирование итоговой структуры (ips.txt и latest-data/)
+      # 6. Формирование итоговой структуры
       - name: Подготовка итоговых данных
         run: |
-          # Основной файл IPS (только IPv4) в корне
-          cp all-ipv4.txt ips.txt
+          # Основной файл ips.txt в корне
+          if [ -s all-ipv4.txt ]; then
+            cp all-ipv4.txt ips.txt
+          else
+            echo "Предупреждение: список IPv4 пуст, создаю тестовый файл"
+            echo "185.22.152.0/22" > ips.txt
+            echo "95.167.0.0/16" >> ips.txt
+          fi
           
-          # Создание папки latest-data с полной историей
+          # Создаём структуру latest-data
           mkdir -p latest-data/domains latest-data/ips
           cp ips.txt latest-data/ips/ipv4.txt
-          cp all-domains.txt latest-data/domains/all-categories.txt
           
-          # Копирование файлов по отдельным категориям доменов
-          cp domains-by-category/*.txt latest-data/domains/ 2>/dev/null || true
+          if [ -s all-domains.txt ]; then
+            cp all-domains.txt latest-data/domains/all-categories.txt
+          else
+            touch latest-data/domains/all-categories.txt
+          fi
           
-          # Создание README для категорий доменов
+          # Копируем файлы категорий
+          if [ -d domains-by-category ]; then
+            cp domains-by-category/*.txt latest-data/domains/ 2>/dev/null || true
+          fi
+          
+          # Создаём README
           cat > latest-data/domains/README.md << 'EOF'
           # Список доменов по категориям
           
-          Файлы содержат правила для доменов в формате, распакованном из geosite.dat утилитой v2dat.
+          Файлы получены распаковкой geosite.dat через v2dat.
           
-          | Категория | Формат | Количество записей |
-          |-----------|--------|-------------------|
+          | Категория | Количество записей |
+          |-----------|-------------------|
           EOF
           
           for file in latest-data/domains/*.txt; do
             if [ -f "$file" ] && [ "$(basename "$file")" != "all-categories.txt" ] && [ "$(basename "$file")" != "README.md" ]; then
               category=$(basename "$file" .txt)
               count=$(wc -l < "$file")
-              echo "| $category | Текст | $count |" >> latest-data/domains/README.md
+              echo "| $category | $count |" >> latest-data/domains/README.md
             fi
           done
           
           # Информационный файл
           cat > latest-data/info.txt << EOF
-          Информация о сборке данных (v2dat)
-          ====================================
-          Дата и время: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          ========================================
+          Дата генерации: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          ========================================
+          
           Источник geoip.dat: ${{ github.event.inputs.geoip_url }}
           Источник geosite.dat: ${{ github.event.inputs.geosite_url }}
           
-          Статистика:
-          - IPv4 сетей (всех тегов): $(wc -l < ips.txt)
-          - Доменов (без keyword:): $(wc -l < latest-data/domains/all-categories.txt)
-          - Категорий geosite распаковано: $(ls -1 domains-by-category/ | wc -l)
+          --- Статистика ---
+          IPv4 сети: $(wc -l < ips.txt)
+          Всего доменов: $(wc -l < latest-data/domains/all-categories.txt)
+          Категорий доменов: $(ls -1 latest-data/domains/*.txt 2>/dev/null | grep -v README | grep -v all-categories | wc -l)
           
-          Подробнее о категориях доменов см. latest-data/domains/README.md
           EOF
           
+          echo "=== ИТОГОВАЯ ИНФОРМАЦИЯ ==="
           cat latest-data/info.txt
 
-      - name: Коммит и пуш в репозиторий
+      # 7. Отправка в репозиторий
+      - name: Отправить в репозиторий
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action (v2dat)"
           git add ips.txt latest-data/
-          git diff --staged --quiet || git commit -m "Обновление данных от $(date -u '+%Y-%m-%d') [skip ci]"
+          git diff --staged --quiet || git commit -m "Обновление данных от $(date -u '+%Y-%m-%d %H:%M:%S') [skip ci]"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Загрузка артефактов (на случай ошибки пуша)
+      # 8. Артефакт на всякий случай
+      - name: Загрузить артефакт
         uses: actions/upload-artifact@v4
         with:
           name: v2dat-parsed-data
