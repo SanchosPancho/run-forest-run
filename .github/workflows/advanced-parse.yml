@@ -1,4 +1,4 @@
-name: Парсинг geoip/geosite (Telegram IP + домены)
+name: Парсинг Telegram IP и доменов
 
 on:
   schedule:
@@ -27,14 +27,16 @@ jobs:
           chmod +x v2dat-bin
           cd ..
           cp v2dat/v2dat-bin ./v2dat-bin
+          echo "v2dat собран успешно"
 
       - name: Загрузка geoip.dat и geosite.dat
         run: |
           mkdir -p source-data
           wget -q -O source-data/geoip.dat https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat
           wget -q -O source-data/geosite.dat https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat
+          ls -lh source-data/
 
-      # ===== IP-сети Telegram (отдельно) =====
+      # ===== ТОЛЬКО IP-сети Telegram =====
       - name: Извлечение IP-сетей Telegram
         run: |
           mkdir -p unpacked/geoip
@@ -43,24 +45,17 @@ jobs:
           if [ -f "unpacked/geoip/geoip_telegram.txt" ]; then
             # Оставляем только IPv4
             grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' unpacked/geoip/geoip_telegram.txt > telegram-ips.txt
-            echo "IP-сети Telegram (IPv4): $(wc -l < telegram-ips.txt)"
-            cat telegram-ips.txt
+            COUNT=$(wc -l < telegram-ips.txt)
+            echo "IP-сети Telegram (IPv4): $COUNT"
+            echo "Примеры:"
+            head -5 telegram-ips.txt
           else
-            echo "Категория telegram не найдена"
-            touch telegram-ips.txt
+            echo "Категория telegram не найдена в geoip.dat"
+            echo "# Telegram IP сети не найдены" > telegram-ips.txt
           fi
 
-      # ===== Все IPv4 сети (общий файл) =====
-      - name: Извлечение всех IPv4 сетей
-        run: |
-          ./v2dat-bin unpack geoip -o unpacked/geoip-all source-data/geoip.dat
-          cat unpacked/geoip-all/*.txt 2>/dev/null | \
-            grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' | \
-            sort -u > ips.txt
-          echo "Всего IPv4 сетей: $(wc -l < ips.txt)"
-
-      # ===== Домены Telegram и других категорий =====
-      - name: Извлечение доменов
+      # ===== ТОЛЬКО домены из нужных категорий =====
+      - name: Извлечение доменов (telegram, youtube, instagram, discord, whatsapp)
         run: |
           CATEGORIES="telegram youtube instagram discord whatsapp"
           mkdir -p unpacked/geosite domains-by-category
@@ -68,6 +63,8 @@ jobs:
           ./v2dat-bin unpack geosite -o unpacked/geosite source-data/geosite.dat
           
           for category in telegram youtube instagram discord whatsapp; do
+            echo "Обработка: $category"
+            
             if [ -f "unpacked/geosite/geosite_${category}.txt" ]; then
               cat "unpacked/geosite/geosite_${category}.txt" | \
                 sed 's/^domain://' | \
@@ -75,23 +72,35 @@ jobs:
                 sed 's/^keyword://' | \
                 sed 's/^regexp://' | \
                 sed 's/@[a-z]*$//' | \
+                sed 's/^\*\.//' | \
                 grep -v '^@' | \
+                grep -v '^regexp:' | \
+                grep -v '^keyword:' | \
+                grep -E '^[a-zA-Z0-9.*-]' | \
                 sort -u > "domains-by-category/${category}.txt"
-              echo "$category: $(wc -l < domains-by-category/${category}.txt) доменов"
+              
+              COUNT=$(wc -l < "domains-by-category/${category}.txt")
+              echo "  ✅ $category: $COUNT доменов"
+              echo "  Примеры:"
+              head -3 "domains-by-category/${category}.txt" | sed 's/^/    /'
             else
+              echo "  ❌ Категория '$category' не найдена"
               touch "domains-by-category/${category}.txt"
             fi
           done
           
+          # Общий файл из всех категорий
           cat domains-by-category/*.txt 2>/dev/null | sort -u > all-domains.txt
+          echo ""
+          echo "Всего уникальных доменов: $(wc -l < all-domains.txt)"
 
       # ===== Формирование итоговой структуры =====
       - name: Подготовка выходных файлов
         run: |
+          # Создаём структуру
           mkdir -p latest-data/domains latest-data/ips
           
-          # IP-файлы
-          cp ips.txt latest-data/ips/ipv4.txt
+          # IP-файлы (только Telegram)
           cp telegram-ips.txt latest-data/ips/telegram-ips.txt
           
           # Домены
@@ -102,17 +111,36 @@ jobs:
           cp domains-by-category/whatsapp.txt latest-data/domains/
           cp all-domains.txt latest-data/domains/all-selected-categories.txt
           
+          # README
+          cat > latest-data/domains/README.md << 'EOF'
+          # Список доменов по категориям (очищенные, без префиксов)
+          
+          | Категория | Количество доменов |
+          |-----------|-------------------|
+          EOF
+          
+          for category in telegram youtube instagram discord whatsapp; do
+            if [ -f "latest-data/domains/${category}.txt" ]; then
+              count=$(wc -l < "latest-data/domains/${category}.txt")
+              echo "| $category | $count |" >> latest-data/domains/README.md
+            fi
+          done
+          
+          echo "" >> latest-data/domains/README.md
+          echo "| **Все категории** | $(wc -l < latest-data/domains/all-selected-categories.txt) |" >> latest-data/domains/README.md
+          
           # Информационный файл
           cat > latest-data/info.txt << EOF
           ========================================
-          Дата: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Дата генерации: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
           ========================================
           
-          --- IP-сети ---
-          Всего IPv4: $(wc -l < ips.txt)
-          Telegram IP-сети: $(wc -l < telegram-ips.txt)
+          Источник: runetfreedom/russia-v2ray-rules-dat
           
-          --- Домены ---
+          --- IP-сети ---
+          Telegram (IPv4): $(wc -l < telegram-ips.txt)
+          
+          --- Домены (очищенные от префиксов) ---
           telegram: $(wc -l < latest-data/domains/telegram.txt)
           youtube: $(wc -l < latest-data/domains/youtube.txt)
           instagram: $(wc -l < latest-data/domains/instagram.txt)
@@ -123,14 +151,15 @@ jobs:
           ========================================
           EOF
           
+          echo "=== ИТОГОВАЯ ИНФОРМАЦИЯ ==="
           cat latest-data/info.txt
 
       - name: Отправить в репозиторий
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add ips.txt telegram-ips.txt latest-data/
-          git diff --staged --quiet || git commit -m "Обновление: IP-сети и домены [skip ci]"
+          git add telegram-ips.txt latest-data/
+          git diff --staged --quiet || git commit -m "Обновление: IP-сети Telegram и домены [skip ci]"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -138,9 +167,8 @@ jobs:
       - name: Загрузить артефакт
         uses: actions/upload-artifact@v4
         with:
-          name: geo-data
+          name: telegram-ips-and-domains
           path: |
-            ips.txt
             telegram-ips.txt
             latest-data/
           retention-days: 30
