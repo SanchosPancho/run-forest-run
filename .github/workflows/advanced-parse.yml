@@ -1,175 +1,185 @@
-name: Advanced Geosite Parser
+name: Парсинг заблокированных IP и доменов (РКН)
 
 on:
   schedule:
-    - cron: '0 */12 * * *'  # Каждые 12 часов
+    - cron: '0 */6 * * *'      # каждые 6 часов
   workflow_dispatch:
     inputs:
-      custom_url:
-        description: 'Custom geosite URL (опционально)'
+      geoip_url:
+        description: 'Ссылка на geoip.dat (IP-сети)'
         required: false
-        type: string
+        default: 'https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat'
+      geosite_url:
+        description: 'Ссылка на geosite.dat (домены)'
+        required: false
+        default: 'https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat'
+      categories:
+        description: 'Категории доменов (через запятую): ru-blocked,telegram,google,netflix,youtube,twitter,openai,discord,facebook,instagram,tiktok,spotify,amazon,microsoft,apple,cloudflare'
+        required: false
+        default: 'ru-blocked,telegram,google,netflix,youtube,twitter,openai'
 
 jobs:
-  parse:
+  parse-geo:
     runs-on: ubuntu-latest
-    
+    name: Извлечение IPv4 и доменов по категориям
+
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install dependencies
+      - name: Получить код репозитория
+        uses: actions/checkout@v4
+
+      - name: Установить Go
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq moreutils pigz
-          pip install requests
-      
-      - name: Download latest geosite
+
+      - name: Установить geoview (утилита для парсинга)
         run: |
-          # Скачиваем свежий geosite.dat
-          wget -O geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
-          
-          # Или кастомный URL
-          if [ -n "${{ github.event.inputs.custom_url }}" ]; then
-            wget -O geosite.dat "${{ github.event.inputs.custom_url }}"
+          git clone https://github.com/snowie2000/geoview.git
+          cd geoview
+          go build -o ../geoview
+          cd ..
+          chmod +x geoview
+
+      # ========== 1. Парсим IPv4 сети из geoip.dat (игнорируем IPv6) ==========
+      - name: Скачать и распарсить geoip.dat (только IPv4)
+        run: |
+          GEOIP_URL="${{ github.event.inputs.geoip_url }}"
+          echo "Скачиваю geoip.dat из: $GEOIP_URL"
+          wget -O geoip.dat "$GEOIP_URL"
+
+          # Извлекаем ТОЛЬКО IPv4 сети
+          ./geoview -type geoip -input geoip.dat -list "" -output all-ips-raw.txt 2>/dev/null || true
+
+          if [ -f all-ips-raw.txt ]; then
+            # Берём только IPv4 (формат: x.x.x.x/xx)
+            grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' all-ips-raw.txt > ipv4.txt
+            sort -u ipv4.txt -o ipv4.txt
+          else
+            touch ipv4.txt
           fi
           
-          # Скачиваем geoip для сетей
-          wget -O geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
-      
-      - name: Setup Python environment
+          echo "Всего IPv4 сетей: $(wc -l < ipv4.txt)"
+
+      # ========== 2. Парсим домены из geosite.dat по категориям ==========
+      - name: Скачать и распарсить geosite.dat (домены по категориям)
         run: |
-          pip install protobuf==3.20.3
-          python3 -c "import sys; print(f'Python {sys.version}')"
-      
-      - name: Extract all domains and IPs
+          GEOSITE_URL="${{ github.event.inputs.geosite_url }}"
+          echo "Скачиваю geosite.dat из: $GEOSITE_URL"
+          wget -O geosite.dat "$GEOSITE_URL"
+
+          CATEGORIES="${{ github.event.inputs.categories }}"
+          IFS=',' read -ra CAT_ARRAY <<< "$CATEGORIES"
+
+          # Создаём папку для доменов по категориям
+          mkdir -p domains-by-category
+
+          for category in "${CAT_ARRAY[@]}"; do
+            category=$(echo "$category" | xargs | tr '[:upper:]' '[:lower:]')
+            echo "Извлекаю категорию: $category"
+
+            # Пробуем разные варианты названий категорий
+            ./geoview -type geosite -input geosite.dat -list "$category" -output "domains-by-category/${category}.txt" 2>/dev/null || \
+            ./geoview -type geosite -input geosite.dat -list "category-$category" -output "domains-by-category/${category}.txt" 2>/dev/null || \
+            ./geoview -type geosite -input geosite.dat -list "geosite:$category" -output "domains-by-category/${category}.txt" 2>/dev/null || \
+            echo "Предупреждение: категория $category не найдена"
+
+            if [ -f "domains-by-category/${category}.txt" ]; then
+              sort -u "domains-by-category/${category}.txt" -o "domains-by-category/${category}.txt"
+              sed -i '/^$/d' "domains-by-category/${category}.txt"
+              echo "  -> ${category}: $(wc -l < domains-by-category/${category}.txt) доменов"
+            else
+              touch "domains-by-category/${category}.txt"
+              echo "  -> ${category}: 0 доменов (категория не найдена)"
+            fi
+          done
+
+          # Создаём общий файл со всеми доменами (опционально)
+          cat domains-by-category/*.txt 2>/dev/null | sort -u > all-domains.txt 2>/dev/null || touch all-domains.txt
+          echo "Всего уникальных доменов: $(wc -l < all-domains.txt 2>/dev/null || echo 0)"
+
+      # ========== 3. Сохраняем результат в репозиторий ==========
+      - name: Копируем итоговые файлы
         run: |
-          mkdir -p output
+          # Основной файл с IPv4 в корне
+          cp ipv4.txt ips.txt
+
+          # Создаём структуру папок
+          mkdir -p latest-data/domains
+          mkdir -p latest-data/ips
+
+          # Копируем IPv4 файлы
+          cp ipv4.txt latest-data/ips/ips.txt
+
+          # Копируем все файлы с доменами по категориям
+          cp domains-by-category/*.txt latest-data/domains/
+
+          # Копируем общий файл (если нужен)
+          cp all-domains.txt latest-data/domains/all-categories.txt
+
+          # Создаём информационный файл
+          cat > latest-data/info.txt << EOF
+          Сгенерировано: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Источник geoip: ${{ github.event.inputs.geoip_url }}
+          Источник geosite: ${{ github.event.inputs.geosite_url }}
+          IPv6: ИСКЛЮЧЁН (только IPv4)
           
-          # Создаем Python скрипт для парсинга
-          cat > parse_geosite.py << 'PYTHON_SCRIPT'
-          import struct
-          import sys
-          import gzip
-          from collections import defaultdict
+          --- Категории доменов ---
+          ${{ github.event.inputs.categories }}
           
-          def read_geosite(filepath):
-              """Простой парсер geosite.dat"""
-              domains = []
-              ips = []
-              
-              try:
-                  with open(filepath, 'rb') as f:
-                      # Пропускаем заголовок
-                      data = f.read()
-                      
-                      # Ищем строки с доменами
-                      import re
-                      text_data = data.decode('utf-8', errors='ignore')
-                      
-                      # Паттерны для доменов
-                      domain_pattern = r'[a-zA-Z0-9][a-zA-Z0-9-]{1,63}\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?'
-                      ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
-                      
-                      domains = re.findall(domain_pattern, text_data)
-                      ips = re.findall(ip_pattern, text_data)
-                      
-              except Exception as e:
-                  print(f"Error: {e}", file=sys.stderr)
-                  
-              return list(set(domains)), list(set(ips))
+          --- Статистика IPv4 ---
+          IPv4 сетей: $(wc -l < ipv4.txt)
           
-          if __name__ == "__main__":
-              domains, ips = read_geosite("geosite.dat")
-              
-              # Сохраняем домены
-              with open("output/all-domains.txt", "w") as f:
-                  for d in sorted(domains):
-                      if len(d) > 3 and '.' in d:
-                          f.write(d + "\n")
-              
-              # Сохраняем IP сети
-              with open("output/all-ips.txt", "w") as f:
-                  for ip in sorted(ips):
-                      f.write(ip + "\n")
-              
-              print(f"Extracted {len(domains)} domains and {len(ips)} IPs")
-              
-              # Категоризация доменов
-              categories = {
-                  'ads': ['doubleclick', 'googlead', 'adservice', 'adserver'],
-                  'social': ['facebook', 'twitter', 'instagram', 'tiktok'],
-                  'streaming': ['netflix', 'hulu', 'disney', 'youtube'],
-                  'messengers': ['telegram', 'whatsapp', 'signal', 'wechat'],
-              }
-              
-              for cat_name, keywords in categories.items():
-                  cat_domains = [d for d in domains if any(kw in d.lower() for kw in keywords)]
-                  with open(f"output/{cat_name}-domains.txt", "w") as f:
-                      for d in sorted(cat_domains):
-                          f.write(d + "\n")
-                  print(f"{cat_name}: {len(cat_domains)} domains")
-          
-          PYTHON_SCRIPT
-          
-          python3 parse_geosite.py
-      
-      - name: Generate different output formats
-        run: |
-          cd output
-          
-          # Формат для Xray
-          cat all-domains.txt | jq -R . | jq -s '{domains: .}' > xray-geosite.json
-          
-          # Формат для iptables
-          awk '{print "-A DOMAIN -d "$1" -j RETURN"}' all-domains.txt > iptables-rules.txt
-          
-          # Формат для dnsmasq (блокировка/перенаправление)
-          awk '{print "address=/"$1"/0.0.0.0"}' all-domains.txt > dns-blacklist.conf
-          awk '{print "server=/"$1"/1.1.1.1"}' all-domains.txt > dns-forward.conf
-          
-          # Формат для hosts
-          awk '{print "0.0.0.0 "$1}' all-domains.txt > hosts-block.txt
-          
-          # Простой текстовый список (тот, что вы хотели)
-          cat all-domains.txt > domains-simple.txt
-          
-          # Создаем архив
-          tar -czf geosite-data.tar.gz *.txt *.conf *.json
-          
-          # Информационный файл
-          cat > info.txt << EOF
-          Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-          Total domains: $(wc -l < all-domains.txt)
-          Total IPs: $(wc -l < all-ips.txt)
-          File sizes: $(du -sh *.txt | paste -sd ',')
+          --- Статистика доменов по категориям ---
           EOF
-      
-      - name: Update repository
+
+          # Добавляем статистику по каждой категории
+          for file in domains-by-category/*.txt; do
+            if [ -f "$file" ]; then
+              catname=$(basename "$file" .txt)
+              count=$(wc -l < "$file")
+              echo "  $catname: $count доменов" >> latest-data/info.txt
+            fi
+          done
+
+          echo "" >> latest-data/info.txt
+          echo "Всего уникальных доменов (без дублей): $(wc -l < all-domains.txt)" >> latest-data/info.txt
+
+          cat latest-data/info.txt
+
+      - name: Создать README для доменов
         run: |
-          # Сохраняем результаты в репозиторий
-          mkdir -p latest-data
-          cp output/domains-simple.txt latest-data/
-          cp output/all-domains.txt latest-data/domains-full.txt
-          cp output/all-ips.txt latest-data/networks.txt
-          cp output/info.txt latest-data/
+          cat > latest-data/domains/README.md << 'EOF'
+          # Список доменов по категориям
           
-          # Для прямого скачивания - создаем симлинк
-          ln -sf latest-data/domains-simple.txt domains.txt
+          Каждый файл содержит домены для своей категории (один домен на строку).
           
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add latest-data/ domains.txt
-          git diff --quiet && git diff --staged --quiet || git commit -m "Update geosite data [skip ci]"
+          | Файл | Описание |
+          |------|----------|
+          EOF
+
+          for file in latest-data/domains/*.txt; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              catname=$(basename "$file" .txt)
+              count=$(wc -l < "$file")
+              echo "| $filename | $catname ($count доменов) |" >> latest-data/domains/README.md
+            fi
+          done
+
+      - name: Отправить в репозиторий
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action (парсер)"
+          git add ips.txt latest-data/
+          git diff --staged --quiet || git commit -m "Автообновление: IPv4 и домены по категориям [skip ci]"
           git push
-      
-      - name: Upload release artifacts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Загрузить артефакт
         uses: actions/upload-artifact@v4
         with:
-          name: geosite-complete
+          name: geo-parsed-data-ipv4-only
           path: |
-            output/domains-simple.txt
-            output/all-domains.txt
-            output/all-ips.txt
-            output/*.json
+            ips.txt
             latest-data/
-          compression-level: 9
+          retention-days: 30
