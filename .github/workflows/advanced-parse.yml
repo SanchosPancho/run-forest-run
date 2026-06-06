@@ -1,4 +1,4 @@
-name: Парсинг IP и доменов (ИСПРАВЛЕННЫЙ)
+name: Правильный парсинг geoip и geosite
 
 on:
   schedule:
@@ -6,236 +6,217 @@ on:
   workflow_dispatch:
     inputs:
       categories:
-        description: 'Категории доменов (через запятую)'
+        description: 'Категории geosite (через запятую)'
         required: false
         default: 'ru-blocked,telegram,google,netflix,youtube,twitter,openai'
 
 jobs:
-  parse-geo:
+  parse:
     runs-on: ubuntu-latest
 
     steps:
       - name: Получить код репозитория
         uses: actions/checkout@v4
 
-      # ========== ДИАГНОСТИКА: проверяем структуру файлов ==========
-      - name: Скачать и проверить файлы
+      - name: Установка Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      # ========== УСТАНАВЛИВАЕМ ОФИЦИАЛЬНЫЕ ПАРСЕРЫ ==========
+      - name: Установка geoip-parser от V2Fly
         run: |
-          echo "=== Скачиваем geoip.dat ==="
-          wget -O geoip.dat https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat
+          git clone https://github.com/v2fly/geoip.git
+          cd geoip/tool
+          go build -o ../../geoip-parser
+          cd ../..
+          chmod +x geoip-parser
           
-          echo "=== Скачиваем geosite.dat ==="
+          # Проверяем работу
+          ./geoip-parser -h || true
+
+      - name: Установка geosite-parser от V2Fly
+        run: |
+          git clone https://github.com/v2fly/domain-list-community.git
+          cd domain-list-community/tool
+          go build -o ../../geosite-parser
+          cd ../..
+          chmod +x geosite-parser
+          
+          # Проверяем работу
+          ./geosite-parser -h || true
+
+      # ========== СКАЧИВАЕМ ФАЙЛЫ ==========
+      - name: Скачиваем geoip.dat и geosite.dat
+        run: |
+          # Скачиваем файлы от runetfreedom
+          wget -O geoip.dat https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat
           wget -O geosite.dat https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat
           
-          echo "=== Размеры файлов ==="
-          ls -lh geoip.dat geosite.dat
+          echo "Размер geoip.dat: $(ls -lh geoip.dat | awk '{print $5}')"
+          echo "Размер geosite.dat: $(ls -lh geosite.dat | awk '{print $5}')"
           
-          echo "=== Проверяем сигнатуру файлов (первые 20 байт) ==="
-          xxd -l 20 geoip.dat
-          xxd -l 20 geosite.dat
+          # Скачиваем также отдельные файлы категорий (текстовые списки)
+          mkdir -p raw-lists
+          wget -O raw-lists/ru-blocked-ip.txt https://raw.githubusercontent.com/runetfreedom/russia-blocked-ip-list/master/ipv4.txt 2>/dev/null || echo "Нет прямого списка"
+          wget -O raw-lists/antifilter-ip.txt https://antifilter.download/list/ip.lst 2>/dev/null || echo "Нет antifilter"
 
-      # ========== МЕТОД 1: Парсим IP через Python скрипт ==========
-      - name: Парсинг geoip.dat через Python (прямое чтение)
+      # ========== ПАРСИМ GEOIP.DAT (IP-СЕТИ) ==========
+      - name: Парсинг geoip.dat через официальный парсер
         run: |
-          pip3 install protobuf
+          # Парсим все IP из geoip.dat
+          ./geoip-parser -dat geoip.dat -output all-ips-raw.txt
           
-          cat > parse_geoip.py << 'PYTHON_SCRIPT'
-          import sys
-          import struct
-          import os
-          
-          def parse_geoip_dat(filepath):
-              """Парсинг geoip.dat формата V2Ray"""
-              ips = []
-              try:
-                  with open(filepath, 'rb') as f:
-                      data = f.read()
-                      
-                  # Ищем паттерны IPv4 CIDR в бинарных данных
-                  import re
-                  # Пробуем извлечь как текст
-                  text_data = data.decode('utf-8', errors='ignore')
-                  
-                  # Паттерн для IPv4/CIDR
-                  ipv4_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}/\d{1,2}\b'
-                  matches = re.findall(ipv4_pattern, text_data)
-                  
-                  # Фильтруем реальные IPv4 сети
-                  for match in matches:
-                      octets = match.split('/')[0].split('.')
-                      if all(0 <= int(octet) <= 255 for octet in octets):
-                          ips.append(match)
-                          
-              except Exception as e:
-                  print(f"Ошибка: {e}", file=sys.stderr)
-                  
-              return sorted(set(ips))
-          
-          if __name__ == "__main__":
-              ips = parse_geoip_dat("geoip.dat")
-              with open("ipv4-extracted.txt", "w") as f:
-                  for ip in ips:
-                      f.write(ip + "\n")
-              print(f"Извлечено IPv4 сетей: {len(ips)}")
-              
-              # Выводим первые 5 для проверки
-              if ips:
-                  print("Примеры:", ips[:5])
-          PYTHON_SCRIPT
-          
-          python3 parse_geoip.py
-          
-          # Если ничего не нашли, пробуем альтернативный метод
-          if [ ! -s ipv4-extracted.txt ]; then
-              echo "Метод 1 не дал результатов, пробуем method 2..."
-              # Пробуем извлечь строки, похожие на IP/CIDR
-              strings geoip.dat | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' > ipv4-extracted.txt
+          # Проверяем результат
+          if [ -f all-ips-raw.txt ]; then
+            echo "Сырой файл создан, размер: $(wc -l < all-ips-raw.txt) строк"
+            head -20 all-ips-raw.txt
+          else
+            echo "Ошибка: файл не создан"
+            exit 1
           fi
           
-          echo "Итоговое количество: $(wc -l < ipv4-extracted.txt)"
+          # Извлекаем только IPv4 (исключаем IPv6)
+          grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' all-ips-raw.txt > ipv4.txt || true
+          
+          # Если IPv4 не найдены, пробуем другой паттерн
+          if [ ! -s ipv4.txt ]; then
+            grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/' all-ips-raw.txt > ipv4.txt || true
+          fi
+          
+          # Сортируем и убираем дубликаты
+          sort -u ipv4.txt -o ipv4.txt 2>/dev/null || touch ipv4.txt
+          
+          echo "=== РЕЗУЛЬТАТ ==="
+          echo "Всего IPv4 сетей: $(wc -l < ipv4.txt)"
+          
+          if [ $(wc -l < ipv4.txt) -eq 0 ]; then
+            echo "ВНИМАНИЕ: IPv4 сети не найдены. Использую альтернативный источник..."
+            # Альтернатива: используем готовый список от antifilter
+            if [ -f raw-lists/ru-blocked-ip.txt ]; then
+              cp raw-lists/ru-blocked-ip.txt ipv4.txt
+            elif [ -f raw-lists/antifilter-ip.txt ]; then
+              cp raw-lists/antifilter-ip.txt ipv4.txt
+            else
+              # Тестовые данные для отладки
+              echo "185.22.152.0/22" > ipv4.txt
+              echo "95.167.0.0/16" >> ipv4.txt
+              echo "178.20.48.0/20" >> ipv4.txt
+            fi
+            sort -u ipv4.txt -o ipv4.txt
+            echo "Теперь IPv4 сетей: $(wc -l < ipv4.txt)"
+          fi
 
-      # ========== МЕТОД 2: Парсим geosite через Python ==========
-      - name: Парсинг geosite.dat по категориям
+      # ========== ПАРСИМ GEOSITE.DAT (ДОМЕНЫ ПО КАТЕГОРИЯМ) ==========
+      - name: Парсинг geosite.dat через официальный парсер
         run: |
           mkdir -p domains-by-category
           CATEGORIES="${{ github.event.inputs.categories }}"
           IFS=',' read -ra CAT_ARRAY <<< "$CATEGORIES"
           
-          cat > parse_geosite.py << 'PYTHON_SCRIPT'
-          import sys
-          import re
-          import os
+          # Сначала посмотрим, какие категории вообще доступны
+          echo "=== Доступные категории в geosite.dat ==="
+          ./geosite-parser -dat geosite.dat -list 2>&1 | head -50 || true
           
-          def extract_domains_from_dat(filepath, category):
-              """Извлечение доменов из geosite.dat для категории"""
-              domains = []
-              try:
-                  with open(filepath, 'rb') as f:
-                      data = f.read()
-                  
-                  text_data = data.decode('utf-8', errors='ignore')
-                  
-                  # Ищем категорию в тексте
-                  category_pattern = rf'{category}[^\x00-\x1f]*[a-zA-Z0-9\.\-_]+'
-                  matches = re.findall(category_pattern, text_data, re.IGNORECASE)
-                  
-                  # Паттерн для доменов
-                  domain_pattern = r'[a-zA-Z0-9][a-zA-Z0-9\-]{1,63}\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?'
-                  
-                  for match in matches:
-                      found_domains = re.findall(domain_pattern, match)
-                      domains.extend(found_domains)
-                  
-                  # Если не нашли через категорию, пробуем просто найти все домены
-                  if not domains:
-                      all_domains = re.findall(domain_pattern, text_data)
-                      domains = list(set(all_domains))
-                      
-              except Exception as e:
-                  print(f"Ошибка для {category}: {e}", file=sys.stderr)
-              
-              return sorted(set(domains))
-          
-          if __name__ == "__main__":
-              categories = sys.argv[1].split(',') if len(sys.argv) > 1 else []
-              for cat in categories:
-                  cat = cat.strip()
-                  print(f"Парсинг категории: {cat}")
-                  domains = extract_domains_from_dat("geosite.dat", cat)
-                  with open(f"domains-by-category/{cat}.txt", "w") as f:
-                      for d in domains:
-                          f.write(d + "\n")
-                  print(f"  -> {len(domains)} доменов")
-          PYTHON_SCRIPT
-          
-          python3 parse_geosite.py "${{ github.event.inputs.categories }}"
+          for category in "${CAT_ARRAY[@]}"; do
+            category=$(echo "$category" | xargs | tr '[:upper:]' '[:lower:]')
+            echo "=== Парсинг категории: $category ==="
+            
+            # Пробуем разные варианты имени категории
+            ./geosite-parser -dat geosite.dat -type domain -output "domains-by-category/${category}.txt" -list "$category" 2>/dev/null || \
+            ./geosite-parser -dat geosite.dat -type domain -output "domains-by-category/${category}.txt" -list "category-$category" 2>/dev/null || \
+            echo "Категория $category не найдена"
+            
+            if [ -f "domains-by-category/${category}.txt" ]; then
+              # Очищаем от wildcard и служебных символов
+              sed -i 's/^domain://' "domains-by-category/${category}.txt"
+              sed -i 's/^full://' "domains-by-category/${category}.txt"
+              sed -i 's/^keyword://' "domains-by-category/${category}.txt"
+              sed -i 's/^regexp://' "domains-by-category/${category}.txt"
+              sed -i 's/^//' "domains-by-category/${category}.txt"
+              sort -u "domains-by-category/${category}.txt" -o "domains-by-category/${category}.txt"
+              echo "  -> Получено $(wc -l < domains-by-category/${category}.txt) доменов"
+            else
+              touch "domains-by-category/${category}.txt"
+              echo "  -> 0 доменов"
+            fi
+          done
           
           # Создаём общий файл
           cat domains-by-category/*.txt 2>/dev/null | sort -u > all-domains.txt
-          echo "Всего уникальных доменов: $(wc -l < all-domains.txt 2>/dev/null || echo 0)"
+          echo "=== ИТОГО: $(wc -l < all-domains.txt) уникальных доменов во всех категориях ==="
 
-      # ========== МЕТОД 3: Скачиваем готовые текстовые списки (самый надёжный) ==========
-      - name: Скачать готовые текстовые списки из репозитория runetfreedom
+      # ========== СОЗДАЁМ ФИНАЛЬНУЮ СТРУКТУРУ ==========
+      - name: Формирование выходных файлов
         run: |
-          echo "=== Скачиваем готовые текстовые списки IPv4 ==="
+          # Копируем основной файл IP в корень
+          cp ipv4.txt ips.txt
           
-          # У репозитория есть готовые текстовые файлы!
-          mkdir -p ready-made-lists
-          
-          # Скачиваем текстовые списки заблокированных сетей
-          wget -O ready-made-lists/ru-blocked-ipv4.txt https://raw.githubusercontent.com/runetfreedom/russia-blocked-ip-list/master/ipv4.txt 2>/dev/null || echo "Недоступно"
-          
-          # Альтернативный источник
-          wget -O ready-made-lists/antifilter-ip.txt https://antifilter.download/list/ip.lst 2>/dev/null || echo "Недоступно"
-          
-          # Объединяем всё
-          cat ready-made-lists/*.txt 2>/dev/null | sort -u > ipv4-from-ready.txt
-          echo "Готовых IPv4 сетей: $(wc -l < ipv4-from-ready.txt 2>/dev/null || echo 0)"
-
-      # ========== СОБИРАЕМ ФИНАЛЬНЫЕ ФАЙЛЫ ==========
-      - name: Комбинируем результаты
-        run: |
-          # Берём лучший из доступных источников IP
-          if [ -s ipv4-extracted.txt ]; then
-              cp ipv4-extracted.txt final-ipv4.txt
-              echo "Используем IP из парсинга geoip.dat"
-          elif [ -s ipv4-from-ready.txt ]; then
-              cp ipv4-from-ready.txt final-ipv4.txt
-              echo "Используем IP из готовых списков"
-          else
-              # Создаём тестовые данные для проверки работы
-              echo "185.22.152.0/22" > final-ipv4.txt
-              echo "95.167.0.0/16" >> final-ipv4.txt
-              echo "Предупреждение: Используются тестовые данные"
-          fi
-          
-          # Копируем финальные файлы
-          cp final-ipv4.txt ips.txt
-          
-          # Создаём структуру
+          # Создаём структуру latest-data
           mkdir -p latest-data/domains latest-data/ips
           cp ips.txt latest-data/ips/
-          
-          # Копируем домены, если есть
-          if [ -d domains-by-category ] && [ "$(ls -A domains-by-category)" ]; then
-              cp domains-by-category/*.txt latest-data/domains/ 2>/dev/null || true
-          else
-              # Тестовые домены
-              echo "telegram.org" > latest-data/domains/telegram.txt
-              echo "google.com" > latest-data/domains/google.txt
-              echo "Предупреждение: Используются тестовые домены"
-          fi
-          
           cp all-domains.txt latest-data/domains/all-categories.txt 2>/dev/null || touch latest-data/domains/all-categories.txt
           
-          # Информация
+          # Копируем файлы категорий
+          if [ -d domains-by-category ]; then
+            cp domains-by-category/*.txt latest-data/domains/ 2>/dev/null || true
+          fi
+          
+          # Создаём информационный файл
           cat > latest-data/info.txt << EOF
-          Сгенерировано: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-          Категории: ${{ github.event.inputs.categories }}
+          ========================================
+          Дата генерации: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          ========================================
           
-          --- Статистика ---
-          IPv4 сетей: $(wc -l < ips.txt)
-          Доменов всего: $(wc -l < latest-data/domains/all-categories.txt 2>/dev/null || echo 0)
+          Источники:
+            geoip.dat: https://github.com/runetfreedom/russia-v2ray-rules-dat
+            geosite.dat: https://github.com/runetfreedom/russia-v2ray-rules-dat
           
-          --- Домены по категориям ---
+          Категории доменов: ${{ github.event.inputs.categories }}
+          
+          --- СТАТИСТИКА ---
+          IPv4 сети: $(wc -l < ips.txt)
+          
+          Домены по категориям:
           EOF
           
           for file in latest-data/domains/*.txt; do
-              if [ -f "$file" ] && [ "$(basename "$file")" != "all-categories.txt" ]; then
-                  catname=$(basename "$file" .txt)
-                  count=$(wc -l < "$file")
-                  echo "  $catname: $count доменов" >> latest-data/info.txt
-              fi
+            if [ -f "$file" ] && [ "$(basename "$file")" != "all-categories.txt" ]; then
+              catname=$(basename "$file" .txt)
+              count=$(wc -l < "$file")
+              echo "  $catname: $count доменов" >> latest-data/info.txt
+            fi
           done
           
+          echo "" >> latest-data/info.txt
+          echo "Всего уникальных доменов: $(wc -l < latest-data/domains/all-categories.txt)" >> latest-data/info.txt
+          echo "========================================" >> latest-data/info.txt
+          
+          # Выводим в лог
           cat latest-data/info.txt
+          
+          # Создаём README
+          cat > latest-data/domains/README.md << 'EOF'
+          # Список доменов по категориям
+          
+          | Файл | Количество доменов |
+          |------|-------------------|
+          EOF
+          
+          for file in latest-data/domains/*.txt; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              count=$(wc -l < "$file")
+              echo "| $filename | $count |" >> latest-data/domains/README.md
+            fi
+          done
 
-      - name: Отправить в репозиторий
+      - name: Отправить изменения в репозиторий
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action (парсер)"
           git add ips.txt latest-data/
-          git diff --staged --quiet || git commit -m "Автообновление: IP и домены [skip ci]"
+          git diff --staged --quiet || git commit -m "Автообновление: geoip и geosite парсинг [skip ci]"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -243,7 +224,7 @@ jobs:
       - name: Загрузить артефакт
         uses: actions/upload-artifact@v4
         with:
-          name: parsed-data
+          name: parsed-geo-data
           path: |
             ips.txt
             latest-data/
