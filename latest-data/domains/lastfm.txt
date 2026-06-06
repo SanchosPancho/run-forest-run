@@ -1,3 +1,0 @@
-full:lastfm.freetls.fastly.net
-full:ws.audioscrobbler.com
-last.fm
