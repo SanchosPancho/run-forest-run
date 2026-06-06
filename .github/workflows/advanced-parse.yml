@@ -1,4 +1,4 @@
-name: Парсинг geoip/geosite через v2dat
+name: Парсинг geoip/geosite (Telegram, YouTube, Instagram, Discord, WhatsApp)
 
 on:
   schedule:
@@ -28,28 +28,23 @@ jobs:
         with:
           go-version: '1.21'
 
-      # 2. Клонирование и сборка v2dat
+      # 2. Сборка v2dat
       - name: Сборка v2dat
         run: |
-          # Удаляем старую папку если есть
           rm -rf v2dat
           git clone https://github.com/urlesistiana/v2dat.git
           cd v2dat
           go build -o v2dat-bin .
           chmod +x v2dat-bin
           cd ..
-          # Копируем бинарник в корень с другим именем
           cp v2dat/v2dat-bin ./v2dat-bin
           echo "v2dat собран успешно"
-          ./v2dat-bin --help | head -n 5
 
       # 3. Загрузка файлов
       - name: Загрузка geoip.dat и geosite.dat
         run: |
           mkdir -p source-data
-          echo "Загрузка geoip.dat..."
           wget -q -O source-data/geoip.dat ${{ github.event.inputs.geoip_url }}
-          echo "Загрузка geosite.dat..."
           wget -q -O source-data/geosite.dat ${{ github.event.inputs.geosite_url }}
           ls -lh source-data/
 
@@ -59,103 +54,88 @@ jobs:
           mkdir -p unpacked/geoip
           ./v2dat-bin unpack geoip -o unpacked/geoip source-data/geoip.dat
           
-          echo "=== Распакованные IP-файлы ==="
-          ls -la unpacked/geoip/
-          
           # Объединение всех IPv4 сетей
-          if [ -d unpacked/geoip ]; then
-            cat unpacked/geoip/*.txt 2>/dev/null | \
-              grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' | \
-              sort -u > all-ipv4.txt
-            COUNT=$(wc -l < all-ipv4.txt)
-            echo "Всего IPv4 сетей: $COUNT"
-            
-            if [ "$COUNT" -eq 0 ]; then
-              echo "Предупреждение: IPv4 сети не найдены"
-            fi
-          else
-            echo "Ошибка: не удалось распаковать geoip.dat"
-            exit 1
-          fi
+          cat unpacked/geoip/*.txt 2>/dev/null | \
+            grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' | \
+            sort -u > all-ipv4.txt
+          
+          IP_COUNT=$(wc -l < all-ipv4.txt)
+          echo "Всего IPv4 сетей: $IP_COUNT"
+          
+          # Копируем в корень
+          cp all-ipv4.txt ips.txt
 
-      # 5. Распаковка geosite.dat (домены по категориям)
-      - name: Распаковка geosite.dat
+      # 5. Распаковка geosite.dat (только нужные категории)
+      - name: Распаковка geosite.dat (telegram, youtube, instagram, discord, whatsapp)
         run: |
+          # Список нужных категорий
+          CATEGORIES="telegram,youtube,instagram,discord,whatsapp"
+          IFS=',' read -ra CAT_ARRAY <<< "$CATEGORIES"
+          
+          # Создаём папку для нужных категорий
+          mkdir -p domains-by-category
+          
+          # Распаковываем geosite.dat полностью во временную папку
           mkdir -p unpacked/geosite
           ./v2dat-bin unpack geosite -o unpacked/geosite source-data/geosite.dat
           
-          echo "=== Распакованные файлы доменов ==="
-          ls -la unpacked/geosite/
+          echo "=== Извлекаю указанные категории ==="
           
-          # Создаём папку для чистых файлов
-          mkdir -p domains-by-category
-          
-          for file in unpacked/geosite/*.txt; do
-            if [ -f "$file" ]; then
-              # Извлекаем имя тега
-              tag=$(basename "$file" .txt | sed 's/^geosite_//')
-              # Копируем и очищаем
-              grep -v '^#' "$file" | sed '/^$/d' > "domains-by-category/${tag}.txt"
-              count=$(wc -l < "domains-by-category/${tag}.txt")
-              echo "Тег '${tag}': ${count} записей"
+          for category in "${CAT_ARRAY[@]}"; do
+            category=$(echo "$category" | xargs | tr '[:upper:]' '[:lower:]')
+            echo "Обработка категории: $category"
+            
+            # Ищем файл с нужной категорией
+            if [ -f "unpacked/geosite/geosite_${category}.txt" ]; then
+              cp "unpacked/geosite/geosite_${category}.txt" "domains-by-category/${category}.txt"
+              count=$(wc -l < "domains-by-category/${category}.txt")
+              echo "  ✅ $category: $count записей"
+            else
+              echo "  ❌ Категория '$category' не найдена в geosite.dat"
+              touch "domains-by-category/${category}.txt"
             fi
           done
           
-          # Создаём общий файл со всеми доменами
-          if [ -d domains-by-category ]; then
-            cat domains-by-category/*.txt 2>/dev/null | sort -u > all-domains.txt
-            echo "Всего уникальных записей во всех категориях: $(wc -l < all-domains.txt)"
-          fi
+          # Создаём общий файл из всех выбранных категорий
+          cat domains-by-category/*.txt 2>/dev/null | sort -u > all-selected-domains.txt
+          echo "=== Всего уникальных доменов в выбранных категориях: $(wc -l < all-selected-domains.txt) ==="
 
       # 6. Формирование итоговой структуры
       - name: Подготовка итоговых данных
         run: |
-          # Основной файл ips.txt в корне
-          if [ -s all-ipv4.txt ]; then
-            cp all-ipv4.txt ips.txt
-            IP_COUNT=$(wc -l < ips.txt)
-          else
-            echo "Предупреждение: список IPv4 пуст, создаю тестовый файл"
-            echo "185.22.152.0/22" > ips.txt
-            echo "95.167.0.0/16" >> ips.txt
-            echo "178.20.48.0/20" >> ips.txt
-            IP_COUNT=3
-          fi
-          
           # Создаём структуру latest-data
           mkdir -p latest-data/domains latest-data/ips
+          
+          # Копируем IPv4
           cp ips.txt latest-data/ips/ipv4.txt
           
-          if [ -s all-domains.txt ]; then
-            cp all-domains.txt latest-data/domains/all-categories.txt
-            DOMAIN_COUNT=$(wc -l < latest-data/domains/all-categories.txt)
-          else
-            touch latest-data/domains/all-categories.txt
-            DOMAIN_COUNT=0
-          fi
+          # Копируем файлы нужных категорий
+          cp domains-by-category/telegram.txt latest-data/domains/ 2>/dev/null || touch latest-data/domains/telegram.txt
+          cp domains-by-category/youtube.txt latest-data/domains/ 2>/dev/null || touch latest-data/domains/youtube.txt
+          cp domains-by-category/instagram.txt latest-data/domains/ 2>/dev/null || touch latest-data/domains/instagram.txt
+          cp domains-by-category/discord.txt latest-data/domains/ 2>/dev/null || touch latest-data/domains/discord.txt
+          cp domains-by-category/whatsapp.txt latest-data/domains/ 2>/dev/null || touch latest-data/domains/whatsapp.txt
           
-          # Копируем файлы категорий
-          if [ -d domains-by-category ]; then
-            cp domains-by-category/*.txt latest-data/domains/ 2>/dev/null || true
-          fi
+          # Копируем общий файл со всеми выбранными доменами
+          cp all-selected-domains.txt latest-data/domains/all-selected-categories.txt 2>/dev/null || touch latest-data/domains/all-selected-categories.txt
           
           # Создаём README
           cat > latest-data/domains/README.md << 'EOF'
           # Список доменов по категориям
           
-          Файлы получены распаковкой geosite.dat через v2dat.
-          
           | Категория | Количество записей |
           |-----------|-------------------|
           EOF
           
-          for file in latest-data/domains/*.txt; do
-            if [ -f "$file" ] && [ "$(basename "$file")" != "all-categories.txt" ] && [ "$(basename "$file")" != "README.md" ]; then
-              category=$(basename "$file" .txt)
-              count=$(wc -l < "$file")
+          for category in telegram youtube instagram discord whatsapp; do
+            if [ -f "latest-data/domains/${category}.txt" ]; then
+              count=$(wc -l < "latest-data/domains/${category}.txt")
               echo "| $category | $count |" >> latest-data/domains/README.md
             fi
           done
+          
+          echo "" >> latest-data/domains/README.md
+          echo "| **Все выбранные категории** | $(wc -l < latest-data/domains/all-selected-categories.txt) |" >> latest-data/domains/README.md
           
           # Информационный файл
           cat > latest-data/info.txt << EOF
@@ -167,22 +147,23 @@ jobs:
           Источник geosite.dat: ${{ github.event.inputs.geosite_url }}
           
           --- Статистика ---
-          IPv4 сети: $IP_COUNT
-          Всего доменов: $DOMAIN_COUNT
-          Категорий доменов: $(ls -1 latest-data/domains/*.txt 2>/dev/null | grep -v README | grep -v all-categories | wc -l)
+          IPv4 сети: $(wc -l < ips.txt)
           
-          --- Список категорий ---
+          --- Выбранные категории доменов ---
+          telegram, youtube, instagram, discord, whatsapp
+          
+          --- Количество записей по категориям ---
+          telegram: $(wc -l < latest-data/domains/telegram.txt 2>/dev/null || echo 0) записей
+          youtube: $(wc -l < latest-data/domains/youtube.txt 2>/dev/null || echo 0) записей
+          instagram: $(wc -l < latest-data/domains/instagram.txt 2>/dev/null || echo 0) записей
+          discord: $(wc -l < latest-data/domains/discord.txt 2>/dev/null || echo 0) записей
+          whatsapp: $(wc -l < latest-data/domains/whatsapp.txt 2>/dev/null || echo 0) записей
+          
+          --- Всего уникальных доменов (без дублей) ---
+          $(wc -l < latest-data/domains/all-selected-categories.txt 2>/dev/null || echo 0) записей
+          
+          ========================================
           EOF
-          
-          for file in latest-data/domains/*.txt; do
-            if [ -f "$file" ] && [ "$(basename "$file")" != "all-categories.txt" ] && [ "$(basename "$file")" != "README.md" ]; then
-              category=$(basename "$file" .txt)
-              count=$(wc -l < "$file")
-              echo "  $category: $count записей" >> latest-data/info.txt
-            fi
-          done
-          
-          echo "========================================" >> latest-data/info.txt
           
           echo "=== ИТОГОВАЯ ИНФОРМАЦИЯ ==="
           cat latest-data/info.txt
@@ -193,16 +174,16 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action (v2dat)"
           git add ips.txt latest-data/
-          git diff --staged --quiet || git commit -m "Обновление данных от $(date -u '+%Y-%m-%d %H:%M:%S') [skip ci]"
+          git diff --staged --quiet || git commit -m "Обновление данных: telegram,youtube,instagram,discord,whatsapp [skip ci]"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 8. Артефакт на всякий случай
+      # 8. Артефакт
       - name: Загрузить артефакт
         uses: actions/upload-artifact@v4
         with:
-          name: v2dat-parsed-data
+          name: selected-geo-data
           path: |
             ips.txt
             latest-data/
