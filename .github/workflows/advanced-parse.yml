@@ -1,0 +1,175 @@
+name: Advanced Geosite Parser
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'  # Каждые 12 часов
+  workflow_dispatch:
+    inputs:
+      custom_url:
+        description: 'Custom geosite URL (опционально)'
+        required: false
+        type: string
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq moreutils pigz
+          pip install requests
+      
+      - name: Download latest geosite
+        run: |
+          # Скачиваем свежий geosite.dat
+          wget -O geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+          
+          # Или кастомный URL
+          if [ -n "${{ github.event.inputs.custom_url }}" ]; then
+            wget -O geosite.dat "${{ github.event.inputs.custom_url }}"
+          fi
+          
+          # Скачиваем geoip для сетей
+          wget -O geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+      
+      - name: Setup Python environment
+        run: |
+          pip install protobuf==3.20.3
+          python3 -c "import sys; print(f'Python {sys.version}')"
+      
+      - name: Extract all domains and IPs
+        run: |
+          mkdir -p output
+          
+          # Создаем Python скрипт для парсинга
+          cat > parse_geosite.py << 'PYTHON_SCRIPT'
+          import struct
+          import sys
+          import gzip
+          from collections import defaultdict
+          
+          def read_geosite(filepath):
+              """Простой парсер geosite.dat"""
+              domains = []
+              ips = []
+              
+              try:
+                  with open(filepath, 'rb') as f:
+                      # Пропускаем заголовок
+                      data = f.read()
+                      
+                      # Ищем строки с доменами
+                      import re
+                      text_data = data.decode('utf-8', errors='ignore')
+                      
+                      # Паттерны для доменов
+                      domain_pattern = r'[a-zA-Z0-9][a-zA-Z0-9-]{1,63}\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?'
+                      ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
+                      
+                      domains = re.findall(domain_pattern, text_data)
+                      ips = re.findall(ip_pattern, text_data)
+                      
+              except Exception as e:
+                  print(f"Error: {e}", file=sys.stderr)
+                  
+              return list(set(domains)), list(set(ips))
+          
+          if __name__ == "__main__":
+              domains, ips = read_geosite("geosite.dat")
+              
+              # Сохраняем домены
+              with open("output/all-domains.txt", "w") as f:
+                  for d in sorted(domains):
+                      if len(d) > 3 and '.' in d:
+                          f.write(d + "\n")
+              
+              # Сохраняем IP сети
+              with open("output/all-ips.txt", "w") as f:
+                  for ip in sorted(ips):
+                      f.write(ip + "\n")
+              
+              print(f"Extracted {len(domains)} domains and {len(ips)} IPs")
+              
+              # Категоризация доменов
+              categories = {
+                  'ads': ['doubleclick', 'googlead', 'adservice', 'adserver'],
+                  'social': ['facebook', 'twitter', 'instagram', 'tiktok'],
+                  'streaming': ['netflix', 'hulu', 'disney', 'youtube'],
+                  'messengers': ['telegram', 'whatsapp', 'signal', 'wechat'],
+              }
+              
+              for cat_name, keywords in categories.items():
+                  cat_domains = [d for d in domains if any(kw in d.lower() for kw in keywords)]
+                  with open(f"output/{cat_name}-domains.txt", "w") as f:
+                      for d in sorted(cat_domains):
+                          f.write(d + "\n")
+                  print(f"{cat_name}: {len(cat_domains)} domains")
+          
+          PYTHON_SCRIPT
+          
+          python3 parse_geosite.py
+      
+      - name: Generate different output formats
+        run: |
+          cd output
+          
+          # Формат для Xray
+          cat all-domains.txt | jq -R . | jq -s '{domains: .}' > xray-geosite.json
+          
+          # Формат для iptables
+          awk '{print "-A DOMAIN -d "$1" -j RETURN"}' all-domains.txt > iptables-rules.txt
+          
+          # Формат для dnsmasq (блокировка/перенаправление)
+          awk '{print "address=/"$1"/0.0.0.0"}' all-domains.txt > dns-blacklist.conf
+          awk '{print "server=/"$1"/1.1.1.1"}' all-domains.txt > dns-forward.conf
+          
+          # Формат для hosts
+          awk '{print "0.0.0.0 "$1}' all-domains.txt > hosts-block.txt
+          
+          # Простой текстовый список (тот, что вы хотели)
+          cat all-domains.txt > domains-simple.txt
+          
+          # Создаем архив
+          tar -czf geosite-data.tar.gz *.txt *.conf *.json
+          
+          # Информационный файл
+          cat > info.txt << EOF
+          Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Total domains: $(wc -l < all-domains.txt)
+          Total IPs: $(wc -l < all-ips.txt)
+          File sizes: $(du -sh *.txt | paste -sd ',')
+          EOF
+      
+      - name: Update repository
+        run: |
+          # Сохраняем результаты в репозиторий
+          mkdir -p latest-data
+          cp output/domains-simple.txt latest-data/
+          cp output/all-domains.txt latest-data/domains-full.txt
+          cp output/all-ips.txt latest-data/networks.txt
+          cp output/info.txt latest-data/
+          
+          # Для прямого скачивания - создаем симлинк
+          ln -sf latest-data/domains-simple.txt domains.txt
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add latest-data/ domains.txt
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update geosite data [skip ci]"
+          git push
+      
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: geosite-complete
+          path: |
+            output/domains-simple.txt
+            output/all-domains.txt
+            output/all-ips.txt
+            output/*.json
+            latest-data/
+          compression-level: 9
