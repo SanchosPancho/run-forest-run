@@ -1,0 +1,21 @@
+Сгенерировано: 2026-06-06 14:29:17 UTC
+Источник geoip: https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat
+Источник geosite: https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat
+IPv6: ИСКЛЮЧЁН (только IPv4)
+
+--- Категории доменов ---
+ru-blocked,telegram,google,netflix,youtube,twitter,openai
+
+--- Статистика IPv4 ---
+IPv4 сетей: 0
+
+--- Статистика доменов по категориям ---
+  google: 0 доменов
+  netflix: 0 доменов
+  openai: 0 доменов
+  ru-blocked: 0 доменов
+  telegram: 0 доменов
+  twitter: 0 доменов
+  youtube: 0 доменов
+
+Всего уникальных доменов (без дублей): 0
