@@ -1,0 +1,8 @@
+slack.com
+slack-edge.com
+slack-msgs.com
+slack-files.com
+slack-imgs.com
+slack-core.com
+gcp.slack.com
+tinyspeck.com
