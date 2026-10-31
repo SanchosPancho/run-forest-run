@@ -6,6 +6,6 @@
 | youtube | 178 |
 | instagram | 74 |
 | discord | 28 |
-| whatsapp | 13 |
+| whatsapp | 11 |
 
-| **Все категории** | 314 |
+| **Все категории** | 312 |
